@@ -48,4 +48,4 @@ Execute order dependent list of VMs
  - Copy the file to dom0*.
  - Run the script
 
-* Copy to dom0 with: `qvm-run --pass-io VM 'cat /home/user/qubes-run-many' > ~/.local/bin/qubes-run-many`
+\* Copy to dom0 with: `qvm-run --pass-io VM 'cat /home/user/qubes-run-many' > ~/.local/bin/qubes-run-many`
