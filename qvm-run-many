@@ -1,0 +1,190 @@
+#!/bin/bash
+
+_qvm_run_many__usage ()
+{
+    echo "usage: `basename "$0"` [qvm-run options] [--preserve-order] <vm> [vm] [...] -- <command> [parameter [...]]" >&2
+}
+
+qvm_run_many__clean_up ()
+{
+    [ -z "$tmp_stdin" -o ! -e "$tmp_stdin" ] || rm "$tmp_stdin"
+}
+trap 'qvm_run_many__clean_up $tmp_stdin; exit' SIGINT
+
+qvm_run_many__vm_exists ()
+{
+    qvm-ls "${vm}" 2>/dev/null >&2
+}
+
+qvm_run_many__vm_dependencies ()
+{
+    # Create sorted list of netvm depenpencies, each netvm separated by /.
+    local chains="" chain="" net netvm vm
+    for vm in "$@"; do
+        #  Create the"grandparent/parent/child" dependency chain tree backwards,
+        # starting with '/child', then '/parent/child' and so on.
+        net=`qvm-ls --raw-data --fields=netvm "${vm}"`
+        chain="/${vm}"
+        while [ "${net}" != "-" ]; do
+            IFS=\| read vm net < <(qvm-ls --raw-data --fields=name,netvm ${net})
+            chain="/${vm}${chain}"
+        done
+        echo "$chain"
+    done
+    
+}
+
+qvm_run_many ()
+{
+    local vms=() opts=() preserve_order=false
+    while [ $# -gt 0 -a "${1}" != -- ]; do
+        
+        if [ "${1::1}" == "-" ]; then
+            
+            case "$1" in
+                
+                --usage|-u|--help|-h)
+                    _qvm_run_many__usage
+                    return 0
+                ;;
+                
+                --preserve-order)
+                    preserve_order=true
+                ;;
+                
+                --input-files)
+                    preserve_order=true
+                ;;
+
+                *)
+                    opts+=( "$1" )
+                ;;
+            
+            esac
+        
+        else
+            vms+=( "$1" )
+        fi
+        
+        shift
+        
+    done
+    
+    if [ "$1" != "--" ]; then
+        _qvm_run_many__usage; return 1
+    else
+        shift
+    fi
+
+    if [ $# -lt 1 ]; then
+        _qvm_run_many__usage; return 1
+    fi
+ 
+    #  If there is no data available at stdin at this point, read it and then
+    # repeat it to each VM. If there is zero bytes available on stdin at this
+    # point, then assume user input on stdin (separated by ^D for each VM).
+    local tmp_stdin=""
+    if read -t 0 -N 0; then
+        #  Store static tmp_stdin in a file so that it can't be repeated to
+        # each VM. (Note: If there's no data on stdin at this point, then the
+        # tmp_stdin will be read directly from stdin.)
+        tmp_stdin=`mktemp`
+        tee "$tmp_stdin"
+    fi
+
+    #
+    # Preparations
+    #
+
+    # Verify VM names.
+    local vm name netvm state states
+    for vm in "${vms[@]}"; do
+        if ! qvm_run_many__vm_exists "${vm}";  then
+            echo "No such domain: '${vm}'" >&2 
+            return 1
+        fi
+    done
+
+
+    #  Generate VM dependency strings. Each string, one for each VM to execute
+    # commands in, read from from  _qvm_run_many__vm_dependencies is a list of
+    # VMs separated by "/". The rightmost of which are the targeted VM. At the
+    # left side of the targeted VM is its configured netvm, and on the netvms
+    # left side is the configured netvm of that machine and so on.
+
+    chains = "$(_qvm_run_many__gen_vm_deps "${vms[@]}")"
+
+    if ! $preserve_order; then
+        #  Sort the list of causing chains (dependency strings) machines with
+	# common VMs to be positioned next to each other so that no machine has
+	# to be started and, possibly, shut down more than once..
+        chains="$(echo "${chains}" | sort)"
+    fi
+
+    readarray -t chains < <(echo "${chains}")
+
+    #
+    # Execution.
+    #
+
+    # > Start with an empty 'state registry' and iterate over the list of chains
+    # >> Append the states of all machines in the dependency chain to the 'state
+    # registry' that is not already in it.
+    # >> Execute the command with qvm-run, starting all machines in the chain.
+    # >> Stop/pause all machines in the current chain that it does not have in
+    # common with the next chain and was not already running..
+    
+    local chain_num=-1 chain_str="" name="" states=()
+    while [ "$((++chain_num))" -lt "${#chains[@]}" ]; do
+        
+        states=()
+        chain_str="${chains[chain_num]}"
+        readarray -d / -t chain < <(echo -n ${chain_str:1})
+        
+        #  Append the states of netvms that 'vm' depends on that is not already
+        # in the list since the previous iteration (the vm before this).
+        while [ "${#states[@]}" -lt "${#chain[@]}" ]; do
+            name="${chain[${#states[@]}-${#chain[@]}]}"
+            states+=( `qvm-ls --raw-data --fields=state "${name}"` )
+        done
+        
+        # Unpause machines (qvm-run does not).
+        n=-1
+        while [ $((++n)) -lt "${#states[@]}" -a "${states[n]}" != Halted ]; do
+            [ ${states[n]} != Paused ] || qvm-unpause ${chain[n]}
+        done
+        
+        # Execute (and repeat the input previously read into a temporary file).
+        if [ -n "$tmp_stdin" ]; then
+            cat "$tmp_stdin" | qvm-run --pass-io "${opts[@]}" "${chain[-1]}" -- "$@"
+        else
+            qvm-run --pass-io "${opts[@]}" "${chain[-1]}" -- "$@"
+        fi
+        
+        #  To know which machines to not shutdown, find the longest common string
+        # at the beginning of the current 'chain' and the 'chain' of the next vm 
+        # to execute a command in.
+        common=`echo "${chain_str}"$'\n'"${chains[chain_num+1]}" |
+        grep -zoP '\A(.*[^/](?=/))(?=.*?\n\1)' | tr -d '\0'`
+        #grep -zoP '\A(.*[^/](?=/|$))(?=.*?\n\1)' | tr -d '\0'`
+
+        pos=$(("${#states[@]}"-1))
+        end=$((`awk -F/ '{print NF-1}' <<< "${common}"`))
+        while [ "$pos" -gt 0 -a $pos -ge "$end" -a "${states[pos]}" != Running ]; do
+            case ${states[pos]} in
+                Halted) qvm-shutdown --wait "${chain[pos]}";;
+                Paused) qvm-pause "${chain[pos]}";;
+            esac
+        pos=$((pos-1))
+        done
+        
+    done
+    
+    qvm_run_many__clean_up
+
+}
+
+if [ "$0" != bash ]; then
+    qvm_run_many "$@"
+fi
+
